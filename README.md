@@ -184,17 +184,30 @@ Mainnet addresses are published after audit completion. Testnet addresses are in
 ```typescript
 import { YieldLadder } from '@yieldladder/sdk';
 
-const yl = new YieldLadder({ network: 'mainnet', signer });
+const yl = new YieldLadder({
+  network: 'mainnet',
+  publicKey: userAddress,       // the account initiating transactions
+  signer,                        // e.g. a WalletAdapter — see app/src/lib/wallet/types.ts
+  vaultRouterContractId: 'CC...',
+  assetContractId: 'CC...',      // the deposit asset's SAC address (e.g. USDC)
+});
 
-await yl.deposit({ tier: 'L6', amount: '500.00' });
+const txHash = await yl.deposit({ tier: 'L6', amount: '500.00' });
 
 const position = await yl.position(userAddress);
-// { tier: 'L6', principal: '500.00', shares: '575',
-//   accruedYield: '12.34', lockUntil: 1781856000 }
+// { tier: 'L6', principal: '5000000000', shares: '5750000000',
+//   accruedYield: '0', lockUntil: 1781856000 }
+// principal/shares are the contract's raw i128 values (7-decimal stroops,
+// same base unit `amount` is submitted in) — not yet decimal-formatted.
 
-await yl.withdraw({ tier: 'L6' });    // throws if lock not expired
-await yl.earlyExit({ tier: 'L6' });   // succeeds, charges 1.25% fee
+await yl.withdraw({ tier: 'L6' });    // throws LockNotExpiredError if the lock hasn't expired
+await yl.earlyExit({ tier: 'L6' });   // succeeds early, exit fee applied by the contract
 ```
+
+Every write method returns the submitted transaction's hash. `signer` must implement
+`signTransaction(xdr, opts?)` (see `sdks/typescript/src/types.ts`'s `Signer` interface) —
+the same shape as the app's `WalletAdapter`, so a real wallet adapter can be passed
+directly without an adapter shim.
 
 The SDK source lives in `sdks/typescript/` and targets `@stellar/stellar-sdk` v12+ with Soroban support.
 

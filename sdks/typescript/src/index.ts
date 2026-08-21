@@ -1,6 +1,12 @@
-export type { Tier, Network, YieldLadderOptions, Position } from './types';
+export type { Tier, Network, YieldLadderOptions, Position, Signer } from './types';
 import type { Tier, YieldLadderOptions, Position, Network } from './types';
-import { LockNotExpiredError, BelowMinDepositError } from './errors';
+import { BelowMinDepositError } from './errors';
+import {
+  addressToScVal,
+  amountToScVal,
+  tierToScVal,
+  TransactionPipeline,
+} from './transactions';
 
 const USDC_DECIMALS = 7;
 const STROOPS_PER_UNIT = 10 ** USDC_DECIMALS;
@@ -19,35 +25,82 @@ const RPC_URLS: Record<Network, string> = {
   testnet: 'https://soroban-testnet.stellar.org',
 };
 
+interface RawPosition {
+  principal: bigint;
+  shares: bigint;
+  lock_until: number;
+}
+
 export class YieldLadder {
   private readonly options: YieldLadderOptions;
-  private readonly rpcUrl: string;
+  private readonly pipeline: TransactionPipeline;
 
   constructor(options: YieldLadderOptions) {
     this.options = options;
-    this.rpcUrl = RPC_URLS[options.network];
+    this.pipeline = new TransactionPipeline({
+      rpcUrl: options.rpcUrl ?? RPC_URLS[options.network],
+      network: options.network,
+      publicKey: options.publicKey,
+      signer: options.signer,
+      transactionTimeoutSeconds: options.transactionTimeoutSeconds,
+    });
   }
 
-  async deposit(params: { tier: Tier; amount: string }): Promise<void> {
+  /** Deposits `amount` (decimal USDC string) into `tier`. Returns the submitted transaction hash. */
+  async deposit(params: { tier: Tier; amount: string }): Promise<string> {
     const stroops = this.toStroops(params.amount);
     if (stroops < TIER_MIN_DEPOSIT[params.tier]) {
       throw new BelowMinDepositError();
     }
-    await this.simulateThenSubmit('deposit', params.tier, stroops.toString());
+
+    return this.pipeline.invoke({
+      contractId: this.options.vaultRouterContractId,
+      method: 'deposit',
+      args: [
+        addressToScVal(this.options.publicKey),
+        tierToScVal(params.tier),
+        addressToScVal(this.options.assetContractId),
+        amountToScVal(stroops),
+      ],
+    });
   }
 
-  async withdraw(params: { tier: Tier }): Promise<void> {
-    try {
-      await this.simulateThenSubmit('withdraw', params.tier);
-    } catch (err: unknown) {
-      if (this.isLockError(err)) throw new LockNotExpiredError();
-      throw err;
-    }
+  /** Withdraws the caller's full matured position from `tier`. Returns the submitted transaction hash. */
+  async withdraw(params: { tier: Tier }): Promise<string> {
+    const position = await this.queryTierPosition(
+      this.options.publicKey,
+      params.tier,
+    );
+
+    return this.pipeline.invoke({
+      contractId: this.options.vaultRouterContractId,
+      method: 'withdraw',
+      args: [
+        addressToScVal(this.options.publicKey),
+        tierToScVal(params.tier),
+        addressToScVal(this.options.assetContractId),
+        amountToScVal(BigInt(position.principal)),
+      ],
+    });
   }
 
-  async earlyExit(params: { tier: Tier }): Promise<void> {
-    await this.simulate('early_exit', params.tier);
-    await this.simulateThenSubmit('early_exit', params.tier);
+  /** Exits the caller's full position from `tier` before maturity (exit fee applies). */
+  async earlyExit(params: { tier: Tier }): Promise<string> {
+    const position = await this.queryTierPosition(
+      this.options.publicKey,
+      params.tier,
+    );
+
+    return this.pipeline.invoke({
+      contractId: this.options.vaultRouterContractId,
+      method: 'early_exit',
+      args: [
+        addressToScVal(this.options.publicKey),
+        tierToScVal(params.tier),
+        addressToScVal(this.options.assetContractId),
+        amountToScVal(BigInt(position.principal)),
+      ],
+    });
   }
 
   async position(address: string): Promise<Position> {
@@ -66,25 +119,29 @@ export class YieldLadder {
     );
   }
 
-  private isLockError(err: unknown): boolean {
-    return err instanceof Error && err.message.toLowerCase().includes('lock');
-  }
+  private async queryTierPosition(
+    address: string,
+    tier: Tier,
+  ): Promise<Position> {
+    const raw = (await this.pipeline.simulateRead({
+      contractId: this.options.vaultRouterContractId,
+      method: 'position',
+      args: [
+        addressToScVal(address),
+        tierToScVal(tier),
+        addressToScVal(this.options.assetContractId),
+      ],
+    })) as RawPosition;
 
-  private async simulate(_method: string, ..._args: unknown[]): Promise<string> {
-    // Build and simulate transaction via SorobanRpc.Server at this.rpcUrl
-    void this.rpcUrl;
-    return '0';
-  }
-
-  private async simulateThenSubmit(
-    _method: string,
-    ..._args: unknown[]
-  ): Promise<void> {
-    // Simulate -> sign with this.options.signer -> submit via SorobanRpc
-    void this.options;
-  }
-
-  private async queryTierPosition(_address: string, tier: Tier): Promise<Position> {
-    return { tier, principal: '0', shares: '0', accruedYield: '0', lockUntil: null };
+    return {
+      tier,
+      principal: raw.principal.toString(),
+      shares: raw.shares.toString(),
+      // VaultRouter's position() doesn't expose accrued yield yet — that
+      // lands with yield distribution in a later issue. 0 here is honest,
+      // not a stub pretending to compute something it can't.
+      accruedYield: '0',
+      lockUntil: raw.lock_until === 0 ? null : raw.lock_until,
+    };
   }
 }
