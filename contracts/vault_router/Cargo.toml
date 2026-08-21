@@ -13,3 +13,7 @@ shared = { path = "../shared" }
 [dev-dependencies]
 soroban-sdk = { version = "20", features = ["testutils"] }
 shared = { path = "../shared", features = ["testutils"] }
+vault_l3 = { path = "../vault_l3" }
+vault_l6 = { path = "../vault_l6" }
+vault_l12 = { path = "../vault_l12" }
+vault_flex = { path = "../vault_flex" }

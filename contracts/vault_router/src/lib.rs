@@ -235,13 +235,14 @@ impl VaultRouter {
         VaultCapacity { max_tvl, remaining }
     }
 
-    /// Renew the lock on a matured position in the given locked tier vault.
+    /// Renew the lock on a matured position in the given locked tier vault,
+    /// for a specific asset position.
     ///
-    /// Passes through to the tier vault's `relock(user)` function.
+    /// Passes through to the tier vault's `relock(user, asset)` function.
     /// Only valid for locked tiers (L3, L6, L12). Flex has no lock period.
     ///
     /// Returns the new `lock_until` ledger sequence number.
-    pub fn relock(env: Env, user: Address, tier: Tier) -> u32 {
+    pub fn relock(env: Env, user: Address, tier: Tier, asset: Address) -> u32 {
         user.require_auth();
 
         // Flex vault has no lock; relock is not applicable
@@ -250,7 +251,7 @@ impl VaultRouter {
         }
 
         let vault = vault_addr(&env, &tier);
-        let args: Vec<Val> = (user,).into_val(&env);
+        let args: Vec<Val> = (user, asset).into_val(&env);
         env.invoke_contract(&vault, &Symbol::new(&env, "relock"), args)
     }
 
@@ -362,7 +363,7 @@ mod test {
         pub fn balance(_env: Env, _user: Address, _asset: Address) -> i128 { 500_000_000_i128 }
         pub fn shares(_env: Env, _user: Address, _asset: Address) -> i128 { 525_000_000_i128 }
         pub fn lock_until(_env: Env, _user: Address, _asset: Address) -> u32 { 1_000_000_u32 }
-        pub fn relock(_env: Env, _user: Address) -> u32 { 2_000_000_u32 }
+        pub fn relock(_env: Env, _user: Address, _asset: Address) -> u32 { 2_000_000_u32 }
         pub fn set_max_tvl(_env: Env, _new_cap: i128) {}
         pub fn max_tvl(_env: Env) -> i128 { 10_000_000_000_i128 }
         pub fn remaining_capacity(_env: Env) -> i128 { 9_500_000_000_i128 }
@@ -566,34 +567,34 @@ mod test {
 
     #[test]
     fn test_relock_routes_to_vault_l3() {
-        let (env, client, _, _, _) = setup();
+        let (env, client, _, _, usdc) = setup();
         let user = Address::generate(&env);
-        let new_lock = client.relock(&user, &Tier::L3);
+        let new_lock = client.relock(&user, &Tier::L3, &usdc);
         assert_eq!(new_lock, 2_000_000_u32);
     }
 
     #[test]
     fn test_relock_routes_to_vault_l6() {
-        let (env, client, _, _, _) = setup();
+        let (env, client, _, _, usdc) = setup();
         let user = Address::generate(&env);
-        let new_lock = client.relock(&user, &Tier::L6);
+        let new_lock = client.relock(&user, &Tier::L6, &usdc);
         assert_eq!(new_lock, 2_000_000_u32);
     }
 
     #[test]
     fn test_relock_routes_to_vault_l12() {
-        let (env, client, _, _, _) = setup();
+        let (env, client, _, _, usdc) = setup();
         let user = Address::generate(&env);
-        let new_lock = client.relock(&user, &Tier::L12);
+        let new_lock = client.relock(&user, &Tier::L12, &usdc);
         assert_eq!(new_lock, 2_000_000_u32);
     }
 
     #[test]
     #[should_panic(expected = "relock not supported for Flex tier")]
     fn test_relock_flex_panics() {
-        let (env, client, _, _, _) = setup();
+        let (env, client, _, _, usdc) = setup();
         let user = Address::generate(&env);
-        client.relock(&user, &Tier::Flex);
+        client.relock(&user, &Tier::Flex, &usdc);
     }
 
     // ── TVL cap management ──────────────────────────────────────────────────
