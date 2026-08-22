@@ -12,21 +12,34 @@ import {
 } from '@stellar/stellar-sdk';
 import type { Network, PaymentStatus, Signer, Tier } from './types';
 import {
+  AmbiguousSubmissionError,
+  AmountExceedsBalanceError,
   AssetNotAllowedError,
   BelowMinDepositError,
   DepositCapExceededError,
   InvalidTierError,
   LockNotExpiredError,
+  NotYetMaturedError,
   ProtocolPausedError,
+  RpcTimeoutError,
+  RpcUnavailableError,
   SimulationFailedError,
   SubmissionFailedError,
   TransactionExpiredError,
   TransactionFailedError,
   TransactionTimedOutError,
   VaultContractError,
+  WalletDisconnectedError,
+  WalletRejectedError,
+  WalletSigningFailedError,
   YieldLadderError,
 } from './errors';
-import { sleep } from './utils';
+import {
+  isTimeoutError,
+  isTransientNetworkError,
+  retryWithBackoff,
+  sleep,
+} from './utils';
 
 const NETWORK_PASSPHRASES: Record<Network, string> = {
   mainnet: Networks.PUBLIC,
@@ -53,6 +66,34 @@ const DEFAULT_POLL_TIMEOUT_MS = 60_000;
  * as `Error(Contract, #N)`, where N is the error enum's discriminant.
  */
 const CONTRACT_ERROR_PATTERN = /Error\(Contract,\s*#(\d+)\)/;
+
+/**
+ * Retry ceiling for transient network/timeout failures on the read-only,
+ * pre-submission RPC calls (`getAccount`, `simulateTransaction`) — issue
+ * #142. Deliberately NOT applied to the signing step (a wallet round-trip
+ * isn't a network call to retry) nor, at this layer, to `sendTransaction`
+ * itself — see `doInvoke`'s own handling of that call's failure modes.
+ */
+const RPC_RETRY_OPTIONS = {
+  maxAttempts: 3,
+  baseDelayMs: 300,
+  maxDelayMs: 3_000,
+  isRetryable: isTransientNetworkError,
+};
+
+/**
+ * Only rewraps an error that's actually a transient-network failure (the
+ * kind `retryWithBackoff` just gave up retrying) into the typed RPC error —
+ * a non-network error (e.g. a malformed request) must pass through
+ * unchanged, not get mislabeled as "RPC unreachable".
+ */
+function toRpcErrorIfTransient(error: unknown): unknown {
+  if (!isTransientNetworkError(error)) {
+    return error;
+  }
+  const raw = error instanceof Error ? error.message : String(error);
+  return isTimeoutError(error) ? new RpcTimeoutError(raw) : new RpcUnavailableError(raw);
+}
 
 export interface TransactionPipelineConfig {
   rpcUrl: string;
@@ -118,7 +159,7 @@ export class TransactionPipeline {
   /** Simulates a read-only call (no signing, no submission) and returns the raw retval, decoded. */
   async simulateRead(params: InvokeContractParams): Promise<unknown> {
     const tx = await this.buildTransaction(params);
-    const sim = await this.server.simulateTransaction(tx);
+    const sim = await this.simulateWithRetry(tx);
     this.throwIfSimulationFailed(sim, params.method);
 
     if (!SorobanRpc.Api.isSimulationSuccess(sim) || sim.result === undefined) {
@@ -219,7 +260,7 @@ export class TransactionPipeline {
 
     // Always simulate fresh for this specific call — never reuse a fee or
     // resource footprint estimated for a different transaction.
-    const sim = await this.server.simulateTransaction(rawTx);
+    const sim = await this.simulateWithRetry(rawTx);
     this.throwIfSimulationFailed(sim, params.method);
 
     let prepared: Transaction;
@@ -233,23 +274,43 @@ export class TransactionPipeline {
     }
 
     // The wallet round-trip happens here — this is where time-bounds can
-    // expire while the user is still looking at the signing prompt.
-    const signedXdr = await this.config.signer.signTransaction(
-      prepared.toXDR(),
-      { network: this.config.network, accountToSign: this.config.publicKey },
-    );
+    // expire while the user is still looking at the signing prompt. Not
+    // retried: asking the wallet to sign again after it just rejected
+    // would either re-prompt confusingly or hang, not recover anything.
+    let signedXdr: string;
+    try {
+      signedXdr = await this.config.signer.signTransaction(prepared.toXDR(), {
+        network: this.config.network,
+        accountToSign: this.config.publicKey,
+      });
+    } catch (error) {
+      throw TransactionPipeline.classifySignerError(error);
+    }
 
     const signedTx = TransactionBuilder.fromXDR(
       signedXdr,
       this.networkPassphrase,
     );
 
+    // Computed locally, before ever calling the network — if `sendTransaction`
+    // below throws ambiguously (network/timeout, no response at all), the
+    // caller still has a hash to independently poll for instead of no way
+    // to look the transaction up at all.
+    const localHash = TransactionPipeline.tryComputeHash(signedTx);
+
     let sendResult: SorobanRpc.Api.SendTransactionResponse;
     try {
       sendResult = await this.server.sendTransaction(signedTx);
     } catch (error) {
-      throw new SubmissionFailedError(
-        `Submitting "${params.method}" failed`,
+      // Soroban RPC's sendTransaction is idempotent by hash (a resubmission
+      // of the identical signed envelope comes back DUPLICATE, not a double
+      // application) — but this exception means we don't even know whether
+      // THIS attempt reached the network, so it's still ambiguous from the
+      // caller's point of view: they must check status by hash (or accept
+      // the SDK's own retry, which is safe precisely because it resends the
+      // same envelope) rather than build and submit a brand new one.
+      throw new AmbiguousSubmissionError(
+        localHash,
         error instanceof Error ? error.message : String(error),
       );
     }
@@ -270,7 +331,12 @@ export class TransactionPipeline {
   private async buildTransaction(
     params: InvokeContractParams,
   ): Promise<Transaction> {
-    const sourceAccount = await this.server.getAccount(this.config.publicKey);
+    const sourceAccount = await retryWithBackoff(
+      () => this.server.getAccount(this.config.publicKey),
+      RPC_RETRY_OPTIONS,
+    ).catch((error) => {
+      throw toRpcErrorIfTransient(error);
+    });
     const contract = new Contract(params.contractId);
     const timeoutSeconds =
       this.config.transactionTimeoutSeconds ?? DEFAULT_TX_TIMEOUT_SECONDS;
@@ -284,6 +350,22 @@ export class TransactionPipeline {
       .build();
   }
 
+  /**
+   * Retries only the transport failure (unreachable/timed-out RPC) —
+   * never retries a normal response that happens to encode a simulation
+   * *error* (that's not transient, retrying it changes nothing).
+   */
+  private async simulateWithRetry(
+    tx: Transaction,
+  ): Promise<SorobanRpc.Api.SimulateTransactionResponse> {
+    return retryWithBackoff(
+      () => this.server.simulateTransaction(tx),
+      RPC_RETRY_OPTIONS,
+    ).catch((error) => {
+      throw toRpcErrorIfTransient(error);
+    });
+  }
+
   private throwIfSimulationFailed(
     sim: SorobanRpc.Api.SimulateTransactionResponse,
     method: string,
@@ -294,7 +376,11 @@ export class TransactionPipeline {
 
     const match = CONTRACT_ERROR_PATTERN.exec(sim.error);
     if (match) {
-      throw TransactionPipeline.mapContractError(Number(match[1]), sim.error);
+      throw TransactionPipeline.mapContractError(
+        method,
+        Number(match[1]),
+        sim.error,
+      );
     }
     throw new SimulationFailedError(
       `Simulating "${method}" failed: ${sim.error}`,
@@ -302,7 +388,44 @@ export class TransactionPipeline {
     );
   }
 
+  /**
+   * Best-effort local hash computation — must never itself throw and mask
+   * the real error it's meant to accompany. Accepts either envelope type
+   * `TransactionBuilder.fromXDR` can return; both expose `.hash()`.
+   */
+  private static tryComputeHash(tx: { hash(): Buffer }): string | null {
+    try {
+      return tx.hash().toString('hex');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Distinguishes a wallet declining to sign (a deliberate user action)
+   * from the wallet dropping the connection mid-flow — neither is a
+   * network or contract failure, so neither should be reported as one.
+   * No single error shape is shared across wallets (Freighter/Albedo/
+   * LOBSTR/...), so this matches on common phrasing rather than a type.
+   */
+  private static classifySignerError(error: unknown): YieldLadderError {
+    const message = (
+      error instanceof Error ? error.message : String(error)
+    ).toLowerCase();
+
+    if (/disconnect|not connected|no wallet|no active/.test(message)) {
+      return new WalletDisconnectedError();
+    }
+    if (/reject|declin|deni|cancel|user closed/.test(message)) {
+      return new WalletRejectedError();
+    }
+    return new WalletSigningFailedError(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+
   private static mapContractError(
+    method: string,
     code: number,
     rawError: string,
   ): YieldLadderError {
@@ -314,11 +437,18 @@ export class TransactionPipeline {
       case 3:
         return new LockNotExpiredError();
       case 4:
-        return new AssetNotAllowedError();
+        // See the code-4 note atop errors.ts: AssetNotAllowed (router,
+        // `deposit`) and NotYetMatured (tier vault, `relock`) collide on
+        // this discriminant — only the calling method disambiguates them.
+        return method === 'relock'
+          ? new NotYetMaturedError()
+          : new AssetNotAllowedError();
       case 5:
         return new DepositCapExceededError();
       case 6:
         return new ProtocolPausedError();
+      case 7:
+        return new AmountExceedsBalanceError();
       default:
         return new VaultContractError(code, rawError);
     }

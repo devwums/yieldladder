@@ -6,15 +6,26 @@ import {
   createIntent,
   beginSubmission,
   markAwaitingSignature,
-  markSubmitted,
-  markConfirmed,
-  markFailed,
   findActiveIntent,
   type PaymentIntent,
 } from "@/lib/paymentIntent";
+import { runPaymentSubmission, defaultPaymentSubmissionDeps } from "@/lib/paymentFlow";
+import { toast } from "@/lib/toast";
 
 function fixed7(n: number) {
   return Math.round(n * 1e7) / 1e7;
+}
+
+/**
+ * TODO(#141 follow-up): stands in for `sdk.earlyExit({ tier, idempotencyKey
+ * })` (sdks/typescript's YieldLadder) until the app depends on the SDK
+ * directly — see the identical TODO on app/src/app/deposit/page.tsx's
+ * placeholderSubmissionHash for why that wiring is deferred.
+ */
+async function placeholderEarlyExitHash(idempotencyKey: string): Promise<string> {
+  return new Promise((resolve) =>
+    setTimeout(() => resolve(`mock-tx-${idempotencyKey}`), 2000),
+  );
 }
 
 export default function EarlyExitModal({
@@ -37,7 +48,9 @@ export default function EarlyExitModal({
 }) {
   const [intent, setIntent] = useState<PaymentIntent | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [status, setStatus] = useState<'idle' | 'pending' | 'confirmed' | 'failed'>('idle');
+  const [status, setStatus] = useState<
+    'idle' | 'pending' | 'confirmed' | 'failed' | 'expired'
+  >('idle');
   const [error, setError] = useState('');
 
   const address = loadSession()?.account.publicKey ?? 'anonymous';
@@ -80,27 +93,22 @@ export default function EarlyExitModal({
     const awaiting = markAwaitingSignature(started);
     setIntent(awaiting);
 
-    try {
-      // sdk.earlyExit({ tier, idempotencyKey: awaiting.key }) would go here
-      const txHash = await new Promise<string>((resolve) =>
-        setTimeout(() => resolve(`mock-tx-${awaiting.key}`), 2000),
-      );
-      const submitted = markSubmitted(awaiting, txHash);
-      setIntent(submitted);
-      const confirmed = markConfirmed(submitted);
-      setIntent(confirmed);
-      setStatus('confirmed');
-    } catch (err) {
-      const failed = markFailed(
-        awaiting,
-        err instanceof Error ? err.message : 'Transaction failed',
-      );
-      setIntent(failed);
-      setStatus('failed');
-      setError(failed.error ?? 'An error occurred. Please try again.');
-    } finally {
-      setSubmitting(false);
+    // Real submit -> sign -> wait -> classify pipeline (issue #142), shared
+    // with the deposit flow via lib/paymentFlow.ts — see that module's docs
+    // for why real failures (network/wallet/on-chain) are reachable here
+    // via injected test doubles rather than only this manual UI trigger.
+    const result = await runPaymentSubmission(awaiting, {
+      ...defaultPaymentSubmissionDeps,
+      submit: placeholderEarlyExitHash,
+    });
+
+    setIntent(result.intent);
+    setStatus(result.status);
+    if (result.message) {
+      setError(result.message);
+      toast.failed(result.message);
     }
+    setSubmitting(false);
   }
 
   const calc = useMemo(() => {
@@ -161,6 +169,11 @@ export default function EarlyExitModal({
         {status === 'pending' && <p>Submitting transaction…</p>}
         {status === 'confirmed' && <p>Exit confirmed.</p>}
         {status === 'failed' && <p style={{ color: '#c33' }}>{error || 'An error occurred. Please try again.'}</p>}
+        {status === 'expired' && (
+          <p style={{ color: '#c33' }}>
+            {error || 'Could not confirm this transaction in time.'}
+          </p>
+        )}
         <div
           style={{
             display: "flex",
@@ -183,7 +196,11 @@ export default function EarlyExitModal({
             disabled={submitting || status === 'confirmed'}
             onClick={handleExitEarly}
           >
-            {submitting ? 'Submitting…' : 'Exit Early'}
+            {submitting
+              ? 'Submitting…'
+              : status === 'failed' || status === 'expired'
+                ? 'Try Again'
+                : 'Exit Early'}
           </button>
         </div>
       </div>

@@ -8,15 +8,11 @@ import {
   createIntent,
   beginSubmission,
   markAwaitingSignature,
-  markSubmitted,
-  markPending,
-  markConfirmed,
-  markFailed,
-  markExpired,
   findActiveIntent,
   type PaymentIntent,
 } from '@/lib/paymentIntent';
-import { waitForTransaction, TransactionTimedOutError } from '@/services/rpc';
+import { toast } from '@/lib/toast';
+import { runPaymentSubmission, defaultPaymentSubmissionDeps } from '@/lib/paymentFlow';
 
 const TIERS = [
   { id: 'flex', label: 'Flex', lock: 'None', lockMonths: 0, multiplier: 1.0, multiplierLabel: '1.00x', exitFee: '0%', minDeposit: 1, apy: 4.2 },
@@ -45,8 +41,9 @@ function lockExpiry(lockMonths: number): string {
  * regenerate `app/pnpm-lock.yaml` correctly — this environment can't
  * safely run that (see the memory-constrained-box note in the repo's
  * contribution history). Everything downstream of the hash this returns
- * (`waitForTransaction` below) is real and already wired for the day this
- * returns a genuine submission hash instead.
+ * (submit -> wait -> classify, in lib/paymentFlow.ts's `runPaymentSubmission`)
+ * is real and already wired for the day this returns a genuine submission
+ * hash instead.
  *
  * Format-valid (64 hex chars, like a real Stellar transaction hash) so it
  * exercises the real confirmation poller end-to-end against the live RPC
@@ -137,42 +134,22 @@ function DepositFlow() {
     const awaiting = markAwaitingSignature(started);
     setIntent(awaiting);
 
-    try {
-      const txHash = await placeholderSubmissionHash(awaiting.key);
-      const submitted = markSubmitted(awaiting, txHash);
-      setIntent(submitted);
+    // Real submit -> sign -> wait -> classify pipeline (issue #142), shared
+    // with EarlyExitModal via lib/paymentFlow.ts so its failure paths are
+    // reachable via real, injected failures in tests — not just this
+    // manual UI trigger.
+    const result = await runPaymentSubmission(awaiting, {
+      ...defaultPaymentSubmissionDeps,
+      submit: placeholderSubmissionHash,
+    });
 
-      const pending = markPending(submitted);
-      setIntent(pending);
-      setTxStatus('pending');
-
-      // Real polling against the live Soroban RPC endpoint (issue #141) —
-      // not a timer. A 20s cap keeps manual testing bearable; production
-      // callers get waitForTransaction's full default (60s).
-      await waitForTransaction(txHash, { timeoutMs: 20_000 });
-
-      const confirmed = markConfirmed(pending);
-      setIntent(confirmed);
-      setTxStatus('confirmed');
-    } catch (error) {
-      if (error instanceof TransactionTimedOutError) {
-        const expired = markExpired(
-          awaiting,
-          'Could not confirm this transaction in time. It may still complete — check back before retrying.',
-        );
-        setIntent(expired);
-        setTxStatus('expired');
-        setTxError(expired.error ?? '');
-      } else {
-        const message = error instanceof Error ? error.message : 'Transaction failed';
-        const failed = markFailed(awaiting, message);
-        setIntent(failed);
-        setTxStatus('failed');
-        setTxError(failed.error ?? 'An error occurred. Please try again.');
-      }
-    } finally {
-      setSubmitting(false);
+    setIntent(result.intent);
+    setTxStatus(result.status);
+    if (result.message) {
+      setTxError(result.message);
+      toast.failed(result.message);
     }
+    setSubmitting(false);
   }
 
   function handleRetry() {

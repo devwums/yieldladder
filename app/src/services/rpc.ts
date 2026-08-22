@@ -1,4 +1,5 @@
 import type { IntentStatus } from '../lib/paymentIntent';
+import type { RetryClassification } from '../lib/retryClassification';
 
 const RPC_URL =
   process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ??
@@ -6,10 +7,71 @@ const RPC_URL =
 
 let _seq = 0;
 
-export async function callRpc<T = unknown>(
-  method: string,
-  params: unknown[] = [],
-): Promise<T> {
+/**
+ * The RPC endpoint could not be reached at all (DNS failure, connection
+ * refused, offline) or responded with a transient server-side error
+ * (429/5xx) — distinct from a timeout, where a connection was established
+ * but no response arrived in time. Raised only after `callRpc`'s own
+ * retry-with-backoff (issue #142) has exhausted its attempts.
+ */
+export class RpcUnavailableError extends Error {
+  readonly retryClassification: RetryClassification = 'retryable-safely';
+  constructor(readonly rawError: string) {
+    super('Could not reach the Soroban RPC endpoint.');
+    this.name = 'RpcUnavailableError';
+  }
+}
+
+/** An RPC request was sent but no response arrived before the deadline. Raised only after retries are exhausted. */
+export class RpcTimeoutError extends Error {
+  readonly retryClassification: RetryClassification = 'retryable-safely';
+  constructor(readonly rawError: string) {
+    super('The Soroban RPC endpoint did not respond in time.');
+    this.name = 'RpcTimeoutError';
+  }
+}
+
+class TransientHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`Soroban RPC HTTP ${status}`);
+    this.name = 'TransientHttpError';
+  }
+}
+
+function isTimeoutMessage(error: unknown): boolean {
+  if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
+    return error.name === 'AbortError' || error.name === 'TimeoutError';
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|ETIMEDOUT/i.test(message);
+}
+
+/**
+ * Distinguishes a transient transport/server failure — worth retrying —
+ * from everything else (a JSON-RPC error the server deliberately returned,
+ * a malformed request, etc.), which must fail immediately instead of being
+ * silently retried into a misleading "RPC unreachable" message.
+ */
+function isRetryableRpcError(error: unknown): boolean {
+  if (error instanceof TransientHttpError) return true;
+  if (error instanceof TypeError) return true; // fetch's own network-failure signature
+  if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
+    return error.name === 'AbortError' || error.name === 'TimeoutError';
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /network|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up/i.test(
+    message,
+  );
+}
+
+const MAX_RPC_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 300;
+const RETRY_MAX_DELAY_MS = 3_000;
+
+async function callRpcOnce<T>(method: string, params: unknown[]): Promise<T> {
+  // A thrown `fetch` rejection (network failure, no response at all)
+  // propagates as-is — isRetryableRpcError below classifies it (a
+  // TypeError) the same way it classifies a transient HTTP status.
   const res = await fetch(RPC_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -17,6 +79,9 @@ export async function callRpc<T = unknown>(
     cache: 'no-store',
   });
 
+  if (res.status === 429 || res.status >= 500) {
+    throw new TransientHttpError(res.status);
+  }
   if (!res.ok) throw new Error(`Soroban RPC HTTP ${res.status}`);
 
   const json = (await res.json()) as {
@@ -27,6 +92,43 @@ export async function callRpc<T = unknown>(
   if (json.error) throw new Error(json.error.message);
   if (json.result === undefined) throw new Error('Empty Soroban RPC result');
   return json.result;
+}
+
+/**
+ * Retries a transient transport/server failure with exponential backoff
+ * and full jitter (issue #142) before giving up with a typed
+ * RpcUnavailableError/RpcTimeoutError. A non-transient failure (a JSON-RPC
+ * error, a malformed request) is never retried and passes through
+ * unmodified — retrying it would just fail again for the same reason.
+ */
+export async function callRpc<T = unknown>(
+  method: string,
+  params: unknown[] = [],
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_RPC_ATTEMPTS; attempt++) {
+    try {
+      return await callRpcOnce<T>(method, params);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableRpcError(error) || attempt === MAX_RPC_ATTEMPTS - 1) {
+        break;
+      }
+      const exponential = Math.min(
+        RETRY_BASE_DELAY_MS * 2 ** attempt,
+        RETRY_MAX_DELAY_MS,
+      );
+      await sleep(Math.random() * exponential);
+    }
+  }
+
+  if (!isRetryableRpcError(lastError)) {
+    throw lastError;
+  }
+  const raw = lastError instanceof Error ? lastError.message : String(lastError);
+  throw isTimeoutMessage(lastError)
+    ? new RpcTimeoutError(raw)
+    : new RpcUnavailableError(raw);
 }
 
 export interface LedgerInfo {
@@ -81,6 +183,11 @@ export function getTransaction(hash: string): Promise<GetTransactionResult> {
  * included"), so no separate XDR inspection is needed to catch this case.
  */
 export class TransactionFailedError extends Error {
+  // Definitive and final (Soroban's single-host-function-invocation
+  // atomicity — see contracts/vault_router/src/lib.rs's withdraw comment),
+  // but the signed envelope that got here is now stale (its sequence
+  // number is consumed either way), so retrying means a fresh intent.
+  readonly retryClassification: RetryClassification = 'retryable-with-new-intent';
   constructor(readonly hash: string) {
     super(`Transaction ${hash} was included but failed on-chain`);
     this.name = 'TransactionFailedError';
@@ -96,6 +203,9 @@ export class TransactionFailedError extends Error {
  * up watching).
  */
 export class TransactionTimedOutError extends Error {
+  // Ambiguous, not a confirmed failure — the caller must re-query chain
+  // state by this hash before assuming anything, never resubmit blindly.
+  readonly retryClassification: RetryClassification = 'retryable-with-new-intent';
   constructor(readonly hash: string) {
     super(`Timed out waiting for transaction ${hash} to confirm`);
     this.name = 'TransactionTimedOutError';

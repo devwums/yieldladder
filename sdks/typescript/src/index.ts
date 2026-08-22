@@ -7,6 +7,30 @@ export type {
   PaymentStatus,
 } from './types';
 export type { WaitForTransactionOptions } from './transactions';
+export type { RetryClassification } from './errors';
+export {
+  YieldLadderError,
+  LockNotExpiredError,
+  BelowMinDepositError,
+  InvalidTierError,
+  AssetNotAllowedError,
+  DepositCapExceededError,
+  ProtocolPausedError,
+  NotYetMaturedError,
+  AmountExceedsBalanceError,
+  VaultContractError,
+  SimulationFailedError,
+  TransactionExpiredError,
+  SubmissionFailedError,
+  TransactionFailedError,
+  TransactionTimedOutError,
+  RpcUnavailableError,
+  RpcTimeoutError,
+  WalletRejectedError,
+  WalletDisconnectedError,
+  WalletSigningFailedError,
+  AmbiguousSubmissionError,
+} from './errors';
 import type { Tier, YieldLadderOptions, Position, Network } from './types';
 import { BelowMinDepositError } from './errors';
 import {

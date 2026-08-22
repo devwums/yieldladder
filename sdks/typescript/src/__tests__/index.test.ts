@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Address, Keypair, nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import { YieldLadder } from '../index';
 import {
+  AmountExceedsBalanceError,
   AssetNotAllowedError,
   BelowMinDepositError,
   LockNotExpiredError,
@@ -190,16 +191,30 @@ describe('YieldLadder', () => {
       ).rejects.toBeInstanceOf(BelowMinDepositError);
     });
 
-    it('falls back to a generic VaultContractError for an unmapped code', async () => {
+    it('maps a simulated AmountExceedsBalance rejection (code 7) to a typed error', async () => {
+      // issue #142: code 7 used to fall back to the generic
+      // VaultContractError — VaultRouter's own code-7 variant (Unauthorized)
+      // is never actually raised anywhere in the contract, so this is
+      // unambiguously VaultL3's AmountExceedsBalance.
       mockSimulateTransaction.mockResolvedValueOnce(
         errorSim('HostError: Error(Contract, #7)'),
+      );
+
+      await expect(
+        sdk.deposit({ tier: 'Flex', amount: '10' }),
+      ).rejects.toBeInstanceOf(AmountExceedsBalanceError);
+    });
+
+    it('falls back to a generic VaultContractError for a genuinely unmapped code', async () => {
+      mockSimulateTransaction.mockResolvedValueOnce(
+        errorSim('HostError: Error(Contract, #99)'),
       );
 
       const error = await sdk
         .deposit({ tier: 'Flex', amount: '10' })
         .catch((e: unknown) => e);
       expect(error).toBeInstanceOf(VaultContractError);
-      expect((error as VaultContractError).code).toBe(7);
+      expect((error as VaultContractError).code).toBe(99);
     });
 
     it('throws TransactionExpiredError when submission reports txTooLate', async () => {
