@@ -5,7 +5,9 @@
 // Two records are persisted per logical operation:
 //  - an "intent" (keyed by kind+address+tier+asset+amount+nonce) tracking
 //    this specific attempt's state machine: idle -> building ->
-//    awaiting_signature -> submitted -> confirmed | failed.
+//    awaiting_signature -> submitted -> pending -> confirmed | failed | expired.
+//    (`submitted` means a tx hash exists; `pending` means the confirmation
+//    poller (issue #141) is actively watching that hash for inclusion.)
 //  - an "operation lock" (keyed by kind+address+tier, NO nonce) pointing at
 //    whichever intent currently holds the right to submit. This is what
 //    stops two browser tabs racing the same deposit even though each tab
@@ -18,13 +20,25 @@
 
 export type IntentKind = 'deposit' | 'withdraw' | 'earlyExit';
 
+/**
+ * Mirrored 1:1 by `PaymentStatus` in sdks/typescript/src/types.ts (issue
+ * #141). The app and SDK are independently-versioned packages with
+ * separate pnpm-lock.yaml files (no shared workspace), so they can't share
+ * a single imported type — keep the literal sets identical by convention:
+ * if you add/rename a value here, update the SDK's copy too. `idle` and
+ * `building` have no SDK-side counterpart (pre-submission, app-local UI
+ * states); the SDK's `simulating` has no app-side counterpart (internal to
+ * `TransactionPipeline.doInvoke`, never observed by the app).
+ */
 export type IntentStatus =
   | 'idle'
   | 'building'
   | 'awaiting_signature'
   | 'submitted'
+  | 'pending'
   | 'confirmed'
-  | 'failed';
+  | 'failed'
+  | 'expired';
 
 export interface PaymentIntent {
   key: string;
@@ -111,7 +125,7 @@ function buildIntentKey(
 }
 
 export function isTerminal(status: IntentStatus): boolean {
-  return status === 'confirmed' || status === 'failed';
+  return status === 'confirmed' || status === 'failed' || status === 'expired';
 }
 
 export function createIntent(
@@ -222,9 +236,10 @@ export function findActiveIntent(
 
 /**
  * The re-entry guard. Refuses (returns null) when:
- *  - this exact intent has already left idle/failed — a double-click on
- *    the same confirm button reuses the same already-generated intent, so
- *    its second call sees status !== idle/failed and is refused; or
+ *  - this exact intent has already left idle/failed/expired — a
+ *    double-click on the same confirm button reuses the same
+ *    already-generated intent, so its second call sees a status outside
+ *    that retry-eligible set and is refused; or
  *  - a DIFFERENT intent for the same logical operation (kind/address/tier)
  *    currently holds the lock and hasn't reached a terminal state — this
  *    is what stops two browser tabs racing the same deposit even though
@@ -244,7 +259,11 @@ export function beginSubmission(
   // (now-stale) React state object from before the first click's update,
   // so trusting `intent.status` here would defeat the guard entirely.
   const current = loadIntent(intent.key, storage) ?? intent;
-  if (current.status !== 'idle' && current.status !== 'failed') {
+  if (
+    current.status !== 'idle' &&
+    current.status !== 'failed' &&
+    current.status !== 'expired'
+  ) {
     return null;
   }
 
@@ -282,6 +301,18 @@ export function markSubmitted(
   return transition(intent, { status: 'submitted', txHash }, storage);
 }
 
+/**
+ * The tx hash has been handed to the confirmation poller (issue #141) and
+ * is actively being watched for inclusion — distinct from `submitted`,
+ * which only means a hash exists.
+ */
+export function markPending(
+  intent: PaymentIntent,
+  storage: StorageLike = defaultStorage(),
+): PaymentIntent {
+  return transition(intent, { status: 'pending' }, storage);
+}
+
 export function markConfirmed(
   intent: PaymentIntent,
   storage: StorageLike = defaultStorage(),
@@ -303,6 +334,24 @@ export function markFailed(
   storage: StorageLike = defaultStorage(),
 ): PaymentIntent {
   const updated = transition(intent, { status: 'failed', error }, storage);
+  releaseLock(intent.kind, intent.address, intent.tier, storage);
+  return updated;
+}
+
+/**
+ * The confirmation poller gave up before the hash ever resolved to a
+ * terminal on-chain outcome (still NOT_FOUND past the poll deadline) —
+ * distinct from `failed`: nothing confirmed the transaction was rejected,
+ * only that we stopped waiting. Also releases the operation lock, same
+ * reasoning as `markFailed`: the user must be able to retry rather than be
+ * stuck behind a lock for a transaction whose outcome is unknown.
+ */
+export function markExpired(
+  intent: PaymentIntent,
+  error: string,
+  storage: StorageLike = defaultStorage(),
+): PaymentIntent {
+  const updated = transition(intent, { status: 'expired', error }, storage);
   releaseLock(intent.kind, intent.address, intent.tier, storage);
   return updated;
 }

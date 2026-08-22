@@ -41,6 +41,12 @@ export function useLastHarvest(): LastHarvestData {
   });
 
   useEffect(() => {
+    // Audited for issue #141's stubbed-data pattern: unlike usePosition
+    // (which had a real VaultRouter contract to call and was fixed to
+    // reflect that), there is no deployed Harvester contract or indexer
+    // this hook could call yet — the RPC layer here has nothing real to
+    // wire to until GF-12 lands. Left as an explicit, tracked stub rather
+    // than aligned with usePosition's fix.
     // TODO(GF-12): Replace with Harvester contract Soroban RPC call
     const lastTimestamp = Date.now() - 3 * 24 * 60 * 60 * 1000;
     const elapsed = Math.floor((Date.now() - lastTimestamp) / 1000);

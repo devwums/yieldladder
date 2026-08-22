@@ -32,6 +32,10 @@ export function useHarvestHistory(limit = 20): HarvestHistoryData {
   });
 
   useEffect(() => {
+    // Audited for issue #141's stubbed-data pattern (see the identical
+    // note in useLastHarvest.ts): no real event indexer exists yet to
+    // wire this to, unlike usePosition's VaultRouter call. Left as an
+    // explicit, tracked stub.
     // TODO(GF-12): Replace with real event indexer queries
     const now = Date.now();
     const events: HarvestEvent[] = Array.from({ length: limit }, (_, i) => {

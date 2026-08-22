@@ -43,3 +43,21 @@ export interface Position {
   accruedYield: string;
   lockUntil: number | null;
 }
+
+/**
+ * Canonical transaction-lifecycle status (issue #141), mirrored 1:1 by
+ * `PaymentStatus` in app/src/lib/paymentIntent.ts's `IntentStatus`. The app
+ * and this SDK are independently-versioned packages with separate
+ * pnpm-lock.yaml files (no shared workspace), so the two can't share a
+ * single imported type — keep the literal sets identical by convention: if
+ * you add/rename a value here, update the app's copy too.
+ */
+export type PaymentStatus =
+  | 'building'
+  | 'simulating'
+  | 'awaiting_signature'
+  | 'submitted'
+  | 'pending'
+  | 'confirmed'
+  | 'failed'
+  | 'expired';

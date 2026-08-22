@@ -4,8 +4,10 @@ import {
   beginSubmission,
   markAwaitingSignature,
   markSubmitted,
+  markPending,
   markConfirmed,
   markFailed,
+  markExpired,
   findActiveIntent,
   loadIntent,
   isTerminal,
@@ -169,5 +171,34 @@ describe('paymentIntent (issue #140)', () => {
     const reloaded = loadIntent(intent.key, storage);
     expect(reloaded).not.toBeNull();
     expect(reloaded!.status).toBe('building');
+  });
+
+  it('markPending transitions submitted -> pending without releasing the lock (issue #141)', () => {
+    const intent = createIntent('deposit', 'GADDR', 'Flex', 'USDC', '10', storage);
+    const building = beginSubmission(intent, storage)!;
+    const submitted = markSubmitted(building, 'tx-hash-3', storage);
+
+    const pending = markPending(submitted, storage);
+    expect(pending.status).toBe('pending');
+    expect(isTerminal(pending.status)).toBe(false);
+
+    // Lock is still held: a second tab racing the same operation is refused.
+    const other = createIntent('deposit', 'GADDR', 'Flex', 'USDC', '10', storage);
+    expect(beginSubmission(other, storage)).toBeNull();
+  });
+
+  it('markExpired is terminal and releases the lock so a retry is not blocked forever (issue #141)', () => {
+    const intent = createIntent('deposit', 'GADDR', 'Flex', 'USDC', '10', storage);
+    const building = beginSubmission(intent, storage)!;
+    const submitted = markSubmitted(building, 'tx-hash-4', storage);
+    const pending = markPending(submitted, storage);
+
+    const expired = markExpired(pending, 'Timed out waiting for confirmation', storage);
+    expect(expired.status).toBe('expired');
+    expect(isTerminal(expired.status)).toBe(true);
+
+    const retried = beginSubmission(expired, storage);
+    expect(retried).not.toBeNull();
+    expect(retried!.status).toBe('building');
   });
 });

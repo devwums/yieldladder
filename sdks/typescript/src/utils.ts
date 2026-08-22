@@ -11,3 +11,7 @@ export function formatUSDC(amount: string): string {
   }
   return num.toFixed(2);
 }
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

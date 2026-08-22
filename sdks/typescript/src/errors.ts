@@ -88,3 +88,31 @@ export class SubmissionFailedError extends YieldLadderError {
     this.name = 'SubmissionFailedError';
   }
 }
+
+/**
+ * A submitted transaction was included in a ledger but did not succeed —
+ * covers both an outright tx-level rejection and a contract call that
+ * reverted after inclusion (Soroban surfaces both as a non-SUCCESS
+ * `getTransaction` status, unlike chains where a reverted call can still be
+ * "successfully included").
+ */
+export class TransactionFailedError extends YieldLadderError {
+  constructor(readonly hash: string) {
+    super(`Transaction ${hash} was included but failed on-chain`);
+    this.name = 'TransactionFailedError';
+  }
+}
+
+/**
+ * Polling gave up before `getTransaction` ever reported SUCCESS or FAILED —
+ * the hash stayed NOT_FOUND past the poll deadline. This can mean the
+ * transaction is still propagating somewhere slow, or that it was quietly
+ * dropped; either way, the caller must stop waiting rather than poll
+ * forever, and should treat this as "unknown," not "confirmed failure."
+ */
+export class TransactionTimedOutError extends YieldLadderError {
+  constructor(readonly hash: string) {
+    super(`Timed out waiting for transaction ${hash} to confirm`);
+    this.name = 'TransactionTimedOutError';
+  }
+}

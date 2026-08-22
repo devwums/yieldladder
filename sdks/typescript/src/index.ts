@@ -1,4 +1,12 @@
-export type { Tier, Network, YieldLadderOptions, Position, Signer } from './types';
+export type {
+  Tier,
+  Network,
+  YieldLadderOptions,
+  Position,
+  Signer,
+  PaymentStatus,
+} from './types';
+export type { WaitForTransactionOptions } from './transactions';
 import type { Tier, YieldLadderOptions, Position, Network } from './types';
 import { BelowMinDepositError } from './errors';
 import {
@@ -6,6 +14,7 @@ import {
   amountToScVal,
   tierToScVal,
   TransactionPipeline,
+  type WaitForTransactionOptions,
 } from './transactions';
 
 const USDC_DECIMALS = 7;
@@ -129,6 +138,21 @@ export class YieldLadder {
         params.idempotencyKey ??
         this.defaultIdempotencyKey('early_exit', params.tier, position.principal),
     });
+  }
+
+  /**
+   * Waits for a previously-submitted transaction (the hash returned by
+   * `deposit`/`withdraw`/`earlyExit`) to reach a terminal on-chain outcome.
+   * Resolves once confirmed; rejects with `TransactionFailedError` if it
+   * failed on-chain or `TransactionTimedOutError` if it never resolved
+   * before the deadline. See `WaitForTransactionOptions` for `onStatus`,
+   * polling interval, and timeout.
+   */
+  async waitForConfirmation(
+    txHash: string,
+    opts?: WaitForTransactionOptions,
+  ): Promise<void> {
+    return this.pipeline.waitForTransaction(txHash, opts);
   }
 
   private defaultIdempotencyKey(
