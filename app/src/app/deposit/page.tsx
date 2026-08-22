@@ -9,11 +9,14 @@ import {
   beginSubmission,
   markAwaitingSignature,
   markSubmitted,
+  markPending,
   markConfirmed,
   markFailed,
+  markExpired,
   findActiveIntent,
   type PaymentIntent,
 } from '@/lib/paymentIntent';
+import { waitForTransaction, TransactionTimedOutError } from '@/services/rpc';
 
 const TIERS = [
   { id: 'flex', label: 'Flex', lock: 'None', lockMonths: 0, multiplier: 1.0, multiplierLabel: '1.00x', exitFee: '0%', minDeposit: 1, apy: 4.2 },
@@ -24,13 +27,39 @@ const TIERS = [
 
 type TierId = typeof TIERS[number]['id'];
 type Step = 1 | 2 | 3 | 4;
-type TxStatus = 'pending' | 'confirmed' | 'failed';
+type TxStatus = 'pending' | 'confirmed' | 'failed' | 'expired';
 
 function lockExpiry(lockMonths: number): string {
   if (lockMonths === 0) return 'No lock';
   const d = new Date();
   d.setMonth(d.getMonth() + lockMonths);
   return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+/**
+ * TODO(#141 follow-up): stands in for `sdk.deposit({ tier: tier.label,
+ * amount, idempotencyKey })` (sdks/typescript's YieldLadder, built in
+ * #139) until the app depends on the SDK directly. That wiring is blocked
+ * here on adding `@yieldladder/sdk`/`@stellar/stellar-sdk` as a real
+ * `app/package.json` dependency, which needs a `pnpm install` to
+ * regenerate `app/pnpm-lock.yaml` correctly — this environment can't
+ * safely run that (see the memory-constrained-box note in the repo's
+ * contribution history). Everything downstream of the hash this returns
+ * (`waitForTransaction` below) is real and already wired for the day this
+ * returns a genuine submission hash instead.
+ *
+ * Format-valid (64 hex chars, like a real Stellar transaction hash) so it
+ * exercises the real confirmation poller end-to-end against the live RPC
+ * endpoint rather than failing fast on obviously-malformed input.
+ */
+async function placeholderSubmissionHash(idempotencyKey: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(idempotencyKey),
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 function DepositFlow() {
@@ -63,13 +92,10 @@ function DepositFlow() {
     setIntent(active);
     setAmount(active.amount);
     setStep(4);
-    setTxStatus(
-      active.status === 'confirmed'
-        ? 'confirmed'
-        : active.status === 'failed'
-          ? 'failed'
-          : 'pending',
-    );
+    // findActiveIntent already excludes terminal states (confirmed/failed/
+    // expired — see isTerminal), so a rehydrated intent is always
+    // mid-flight; anything short of that bucket falls back to 'pending'.
+    setTxStatus('pending');
     if (active.error) setTxError(active.error);
     // Intentionally mount-only: this is a one-time rehydration check, not a
     // live subscription to tier/address changes.
@@ -112,23 +138,38 @@ function DepositFlow() {
     setIntent(awaiting);
 
     try {
-      // sdk.deposit({ tier: tier.label, amount, idempotencyKey: awaiting.key }) would go here
-      const txHash = await new Promise<string>((resolve) =>
-        setTimeout(() => resolve(`mock-tx-${awaiting.key}`), 2000),
-      );
+      const txHash = await placeholderSubmissionHash(awaiting.key);
       const submitted = markSubmitted(awaiting, txHash);
       setIntent(submitted);
-      const confirmed = markConfirmed(submitted);
+
+      const pending = markPending(submitted);
+      setIntent(pending);
+      setTxStatus('pending');
+
+      // Real polling against the live Soroban RPC endpoint (issue #141) —
+      // not a timer. A 20s cap keeps manual testing bearable; production
+      // callers get waitForTransaction's full default (60s).
+      await waitForTransaction(txHash, { timeoutMs: 20_000 });
+
+      const confirmed = markConfirmed(pending);
       setIntent(confirmed);
       setTxStatus('confirmed');
     } catch (error) {
-      const failed = markFailed(
-        awaiting,
-        error instanceof Error ? error.message : 'Transaction failed',
-      );
-      setIntent(failed);
-      setTxStatus('failed');
-      setTxError(failed.error ?? 'An error occurred. Please try again.');
+      if (error instanceof TransactionTimedOutError) {
+        const expired = markExpired(
+          awaiting,
+          'Could not confirm this transaction in time. It may still complete — check back before retrying.',
+        );
+        setIntent(expired);
+        setTxStatus('expired');
+        setTxError(expired.error ?? '');
+      } else {
+        const message = error instanceof Error ? error.message : 'Transaction failed';
+        const failed = markFailed(awaiting, message);
+        setIntent(failed);
+        setTxStatus('failed');
+        setTxError(failed.error ?? 'An error occurred. Please try again.');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -277,6 +318,18 @@ function DepositFlow() {
               <div style={s.failIcon}>✗</div>
               <h2 style={s.cardTitle}>Transaction Failed</h2>
               <p style={s.errText}>{txError || 'An error occurred. Please try again.'}</p>
+              <button style={s.btnPrimary} type="button" onClick={handleRetry}>
+                Try Again
+              </button>
+            </>
+          )}
+          {txStatus === 'expired' && (
+            <>
+              <div style={s.failIcon}>?</div>
+              <h2 style={s.cardTitle}>Confirmation Timed Out</h2>
+              <p style={s.errText}>
+                {txError || 'Could not confirm this transaction in time.'}
+              </p>
               <button style={s.btnPrimary} type="button" onClick={handleRetry}>
                 Try Again
               </button>
