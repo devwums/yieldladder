@@ -3,6 +3,17 @@
 import { useState, useEffect, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import Link from 'next/link';
+import { loadSession } from '@/lib/wallet/session';
+import {
+  createIntent,
+  beginSubmission,
+  markAwaitingSignature,
+  markSubmitted,
+  markConfirmed,
+  markFailed,
+  findActiveIntent,
+  type PaymentIntent,
+} from '@/lib/paymentIntent';
 
 const TIERS = [
   { id: 'flex', label: 'Flex', lock: 'None', lockMonths: 0, multiplier: 1.0, multiplierLabel: '1.00x', exitFee: '0%', minDeposit: 1, apy: 4.2 },
@@ -31,10 +42,39 @@ function DepositFlow() {
   const [amount, setAmount] = useState('');
   const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
   const [txError, setTxError] = useState('');
+  const [intent, setIntent] = useState<PaymentIntent | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  // Not gated behind a "must connect wallet" requirement (out of scope
+  // here) — falls back to a placeholder so the idempotency key is still
+  // well-formed if a user somehow reaches this page unconnected.
+  const address = loadSession()?.account.publicKey ?? 'anonymous';
 
   useEffect(() => {
     if (paramTier) setTierId(paramTier);
   }, [paramTier]);
+
+  // Rehydrate on mount: a previous submission that reached `submitted` (or
+  // later) before a reload must be resumed, not silently allowed to be
+  // resubmitted (issue #140).
+  useEffect(() => {
+    const active = findActiveIntent('deposit', address, tierId);
+    if (!active) return;
+    setIntent(active);
+    setAmount(active.amount);
+    setStep(4);
+    setTxStatus(
+      active.status === 'confirmed'
+        ? 'confirmed'
+        : active.status === 'failed'
+          ? 'failed'
+          : 'pending',
+    );
+    if (active.error) setTxError(active.error);
+    // Intentionally mount-only: this is a one-time rehydration check, not a
+    // live subscription to tier/address changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const tier = TIERS.find((t) => t.id === tierId)!;
   const amountNum = parseFloat(amount) || 0;
@@ -45,14 +85,59 @@ function DepositFlow() {
   const shares = (amountNum * tier.multiplier).toFixed(0);
   const estimatedFee = '0.00001 XLM';
 
-  function handleConfirm() {
+  // Generated once per arrival at the confirm step (issue #140) — a fresh
+  // nonce every time, so re-entering step 3 with a changed amount/tier
+  // never silently reuses a stale key, while double-clicking Confirm on
+  // the SAME step-3 visit reuses the SAME intent.
+  function handleEnterConfirmStep() {
+    setIntent(createIntent('deposit', address, tierId, 'USDC', amount));
+    setStep(3);
+  }
+
+  async function handleConfirm() {
+    if (!intent || submitting) return;
+
+    // The actual, race-safe guard: reads/writes storage synchronously, so
+    // even two handleConfirm invocations fired back-to-back before any
+    // re-render (a real double-click) can't both pass this check.
+    const started = beginSubmission(intent);
+    if (!started) return;
+
+    setSubmitting(true);
+    setIntent(started);
     setStep(4);
     setTxStatus('pending');
-    // sdk.deposit({ tier: tier.label, amount }) would go here
-    setTimeout(() => setTxStatus('confirmed'), 2000);
+
+    const awaiting = markAwaitingSignature(started);
+    setIntent(awaiting);
+
+    try {
+      // sdk.deposit({ tier: tier.label, amount, idempotencyKey: awaiting.key }) would go here
+      const txHash = await new Promise<string>((resolve) =>
+        setTimeout(() => resolve(`mock-tx-${awaiting.key}`), 2000),
+      );
+      const submitted = markSubmitted(awaiting, txHash);
+      setIntent(submitted);
+      const confirmed = markConfirmed(submitted);
+      setIntent(confirmed);
+      setTxStatus('confirmed');
+    } catch (error) {
+      const failed = markFailed(
+        awaiting,
+        error instanceof Error ? error.message : 'Transaction failed',
+      );
+      setIntent(failed);
+      setTxStatus('failed');
+      setTxError(failed.error ?? 'An error occurred. Please try again.');
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function handleRetry() {
+    // Reuses the SAME (now-failed) intent — a retry continues the same
+    // user-intended payment, it isn't a new deliberate deposit, so it
+    // should not get a new nonce.
     setTxStatus(null);
     setTxError('');
     setStep(3);
@@ -129,7 +214,7 @@ function DepositFlow() {
               style={belowMin || !amountNum ? s.btnDisabled : s.btnPrimary}
               type="button"
               disabled={belowMin || !amountNum}
-              onClick={() => setStep(3)}
+              onClick={handleEnterConfirmStep}
             >
               Continue
             </button>
@@ -152,7 +237,12 @@ function DepositFlow() {
           </dl>
           <div style={s.btnRow}>
             <button style={s.btnSecondary} type="button" onClick={() => setStep(2)}>Back</button>
-            <button style={s.btnPrimary} type="button" onClick={handleConfirm}>
+            <button
+              style={submitting ? s.btnDisabled : s.btnPrimary}
+              type="button"
+              disabled={submitting}
+              onClick={handleConfirm}
+            >
               Confirm &amp; Deposit
             </button>
           </div>

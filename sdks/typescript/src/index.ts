@@ -46,8 +46,21 @@ export class YieldLadder {
     });
   }
 
-  /** Deposits `amount` (decimal USDC string) into `tier`. Returns the submitted transaction hash. */
-  async deposit(params: { tier: Tier; amount: string }): Promise<string> {
+  /**
+   * Deposits `amount` (decimal USDC string) into `tier`. Returns the
+   * submitted transaction hash.
+   *
+   * `idempotencyKey` guards against a double-click/retry submitting twice
+   * (issue #140) — defaults to a key derived from the account/tier/asset/
+   * amount, so two calls with identical params dedup automatically. Pass
+   * your own key (e.g. a per-intent nonce) if you need two calls with
+   * otherwise-identical params to NOT be conflated.
+   */
+  async deposit(params: {
+    tier: Tier;
+    amount: string;
+    idempotencyKey?: string;
+  }): Promise<string> {
     const stroops = this.toStroops(params.amount);
     if (stroops < TIER_MIN_DEPOSIT[params.tier]) {
       throw new BelowMinDepositError();
@@ -62,11 +75,17 @@ export class YieldLadder {
         addressToScVal(this.options.assetContractId),
         amountToScVal(stroops),
       ],
+      idempotencyKey:
+        params.idempotencyKey ??
+        this.defaultIdempotencyKey('deposit', params.tier, params.amount),
     });
   }
 
-  /** Withdraws the caller's full matured position from `tier`. Returns the submitted transaction hash. */
-  async withdraw(params: { tier: Tier }): Promise<string> {
+  /**
+   * Withdraws the caller's full matured position from `tier`. Returns the
+   * submitted transaction hash. See `deposit`'s doc for `idempotencyKey`.
+   */
+  async withdraw(params: { tier: Tier; idempotencyKey?: string }): Promise<string> {
     const position = await this.queryTierPosition(
       this.options.publicKey,
       params.tier,
@@ -81,11 +100,17 @@ export class YieldLadder {
         addressToScVal(this.options.assetContractId),
         amountToScVal(BigInt(position.principal)),
       ],
+      idempotencyKey:
+        params.idempotencyKey ??
+        this.defaultIdempotencyKey('withdraw', params.tier, position.principal),
     });
   }
 
-  /** Exits the caller's full position from `tier` before maturity (exit fee applies). */
-  async earlyExit(params: { tier: Tier }): Promise<string> {
+  /**
+   * Exits the caller's full position from `tier` before maturity (exit fee
+   * applies). See `deposit`'s doc for `idempotencyKey`.
+   */
+  async earlyExit(params: { tier: Tier; idempotencyKey?: string }): Promise<string> {
     const position = await this.queryTierPosition(
       this.options.publicKey,
       params.tier,
@@ -100,7 +125,24 @@ export class YieldLadder {
         addressToScVal(this.options.assetContractId),
         amountToScVal(BigInt(position.principal)),
       ],
+      idempotencyKey:
+        params.idempotencyKey ??
+        this.defaultIdempotencyKey('early_exit', params.tier, position.principal),
     });
+  }
+
+  private defaultIdempotencyKey(
+    method: string,
+    tier: Tier,
+    amount: string,
+  ): string {
+    return [
+      method,
+      this.options.publicKey,
+      tier,
+      this.options.assetContractId,
+      amount,
+    ].join(':');
   }
 
   async position(address: string): Promise<Position> {
