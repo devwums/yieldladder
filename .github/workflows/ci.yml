@@ -59,6 +59,10 @@ jobs:
         working-directory: app
         run: pnpm typecheck
 
+      - name: Test
+        working-directory: app
+        run: pnpm test
+
   sdk:
     name: TypeScript SDK
     runs-on: ubuntu-latest

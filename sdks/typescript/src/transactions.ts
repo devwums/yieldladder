@@ -50,6 +50,16 @@ export interface InvokeContractParams {
   contractId: string;
   method: string;
   args: xdr.ScVal[];
+  /**
+   * Dedup key (issue #140): concurrent invoke() calls sharing the same
+   * idempotencyKey return the SAME in-flight promise instead of each
+   * building/simulating/submitting their own transaction — guards a
+   * double-click or a retry-after-dropped-response from racing two
+   * separate submissions of the same intent. The key is released the
+   * moment the call settles (success or failure), so it never blocks a
+   * later, genuinely separate call reusing the same key.
+   */
+  idempotencyKey?: string;
 }
 
 /** Encodes a Tier the same way Soroban encodes any #[contracttype] enum variant. */
@@ -73,6 +83,7 @@ export function amountToScVal(amount: bigint): xdr.ScVal {
 export class TransactionPipeline {
   private readonly server: SorobanRpc.Server;
   private readonly networkPassphrase: string;
+  private readonly inFlight = new Map<string, Promise<string>>();
 
   constructor(private readonly config: TransactionPipelineConfig) {
     this.server = new SorobanRpc.Server(config.rpcUrl);
@@ -99,8 +110,38 @@ export class TransactionPipeline {
    * write call. Returns the submitted transaction's hash — callers who need
    * confirmation should watch the vault's state (a later issue's concern),
    * not assume submission alone means success.
+   *
+   * When `idempotencyKey` is set, a call already in flight for that key is
+   * returned as-is instead of starting a second one (issue #140).
    */
   async invoke(params: InvokeContractParams): Promise<string> {
+    const { idempotencyKey } = params;
+    if (idempotencyKey) {
+      const existing = this.inFlight.get(idempotencyKey);
+      if (existing) {
+        return existing;
+      }
+    }
+
+    const promise = this.doInvoke(params);
+
+    if (idempotencyKey) {
+      this.inFlight.set(idempotencyKey, promise);
+      // Release once settled — a distinct chained promise, so this never
+      // affects the original `promise` returned to the caller above.
+      promise
+        .finally(() => {
+          if (this.inFlight.get(idempotencyKey) === promise) {
+            this.inFlight.delete(idempotencyKey);
+          }
+        })
+        .catch(() => undefined);
+    }
+
+    return promise;
+  }
+
+  private async doInvoke(params: InvokeContractParams): Promise<string> {
     const rawTx = await this.buildTransaction(params);
 
     // Always simulate fresh for this specific call — never reuse a fee or
